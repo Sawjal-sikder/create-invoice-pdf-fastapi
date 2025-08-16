@@ -1,9 +1,12 @@
 from fastapi import FastAPI, Response
 from pydantic import BaseModel
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4 # type: ignore
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer # type: ignore
+from reportlab.lib import colors # pyright: ignore[reportMissingModuleSource]
+from reportlab.lib.styles import getSampleStyleSheet # type: ignore
 from io import BytesIO
 import datetime
+import asyncio
 
 app = FastAPI()
 
@@ -18,54 +21,65 @@ class InvoiceData(BaseModel):
     customer_name: str
     items: list[InvoiceItem]
 
-# API endpoint to create invoice PDF
-@app.post("/create-invoice/")
-def create_invoice(invoice: InvoiceData):
-    # Create PDF in memory
+
+def generate_pdf(invoice: InvoiceData) -> bytes:
     buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+
+    styles = getSampleStyleSheet()
+    elements = []
 
     # Header
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(50, height - 50, f"Invoice #{invoice.invoice_no}")
+    elements.append(Paragraph(f"<b>Invoice #{invoice.invoice_no}</b>", styles["Title"]))
+    elements.append(Paragraph(f"Customer: {invoice.customer_name}", styles["Normal"]))
+    elements.append(Paragraph(f"Date: {datetime.date.today()}", styles["Normal"]))
+    elements.append(Spacer(1, 20))
 
-    c.setFont("Helvetica", 12)
-    c.drawString(50, height - 80, f"Customer: {invoice.customer_name}")
-    c.drawString(50, height - 100, f"Date: {datetime.date.today()}")
-
-    # Table header
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(50, height - 140, "Description")
-    c.drawString(300, height - 140, "Quantity")
-    c.drawString(400, height - 140, "Price")
-    c.drawString(500, height - 140, "Total")
-
-    # Table rows
-    y = height - 160
+    # Table data (header + rows)
+    data = [["Description", "Quantity", "Price", "Total"]]
     total_amount = 0
-    c.setFont("Helvetica", 12)
 
     for item in invoice.items:
         line_total = item.quantity * item.price
         total_amount += line_total
+        data.append([
+            item.description,
+            str(item.quantity),
+            f"${item.price:.2f}",
+            f"${line_total:.2f}",
+        ])
 
-        c.drawString(50, y, item.description)
-        c.drawString(300, y, str(item.quantity))
-        c.drawString(400, y, f"${item.price:.2f}")
-        c.drawString(500, y, f"${line_total:.2f}")
-        y -= 20
+    # Add grand total row
+    data.append(["", "", "Grand Total:", f"${total_amount:.2f}"])
 
-    # Total
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(400, y - 20, "Grand Total:")
-    c.drawString(500, y - 20, f"${total_amount:.2f}")
+    # Create table
+    table = Table(data, colWidths=[200, 80, 100, 100])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightblue),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+        ("ALIGN", (1, 1), (-1, -1), "CENTER"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+        ("BACKGROUND", (0, 1), (-1, -2), colors.beige),
+        ("GRID", (0, 0), (-1, -1), 1, colors.black),
+        ("FONTNAME", (-2, -1), (-1, -1), "Helvetica-Bold"),
+    ]))
 
-    c.showPage()
-    c.save()
+    elements.append(table)
 
-    buffer.seek(0)
+    # Build PDF
+    doc.build(elements)
     pdf_content = buffer.getvalue()
     buffer.close()
+    return pdf_content
 
-    return Response(content=pdf_content, media_type="application/pdf")
+
+@app.post("/create-invoice/")
+async def create_invoice(invoice: InvoiceData):
+    pdf_content = await asyncio.to_thread(generate_pdf, invoice)
+    return Response(
+        content=pdf_content,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"inline; filename=invoice_{invoice.invoice_no}.pdf"}
+    )
